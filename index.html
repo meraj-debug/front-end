@@ -314,11 +314,9 @@ table.v6-managed th{white-space:nowrap}
     <h2 style="font-size:19px;font-weight:800">Sign in to the CRM</h2>
     <p style="font-size:12px;color:var(--muted);margin:4px 0 16px">Pre-sales, sales, post-sales and approvals in one place.</p>
     <div id="loginErr" style="display:none;background:var(--bad-bg);color:var(--bad);padding:9px 11px;border-radius:8px;font-size:11.5px;font-weight:700;margin-bottom:10px"></div>
-    <div class="fg"><label class="f">Username or e-mail</label><input id="lu" class="inp" placeholder="admin  ·  you@inframantra.com" onkeydown="if(event.key==='Enter')doLogin()"></div>
-    <div class="fg"><label class="f">Password</label><input id="lp" type="password" class="inp" placeholder="123" onkeydown="if(event.key==='Enter')doLogin()"></div>
+    <div class="fg"><label class="f">Username or e-mail</label><input id="lu" class="inp" placeholder="you@inframantra.com" autocomplete="username" onkeydown="if(event.key==='Enter')doLogin()"></div>
+    <div class="fg"><label class="f">Password</label><input id="lp" type="password" class="inp" autocomplete="current-password" onkeydown="if(event.key==='Enter')doLogin()"></div>
     <button class="btn btn-p" style="width:100%;justify-content:center;padding:11px" onclick="doLogin()">Sign in</button>
-    <p style="font-size:10.5px;color:var(--muted-2);margin-top:14px">Tap a demo account below to sign in. Meraj Varid (System Admin): <b class="mono">meraj / Meraj@2026</b></p>
-    <div class="rolechip" id="roleChips"></div>
   </div>
 </div>
 
@@ -845,7 +843,7 @@ function seed(){
 function doLogin(){
   const u=el('lu').value.trim().toLowerCase(),p=el('lp').value.trim();
   const f=USERS.find(x=>x.u===u&&x.p===p);
-  if(!f){const e=el('loginErr');e.textContent='That username and password don’t match. Try admin / 123.';e.style.display='block';return;}
+  if(!f){const e=el('loginErr');e.textContent='That username and password don’t match.';e.style.display='block';return;}
   ME=f; el('login').style.display='none'; el('app').style.display='block';
   el('uav').textContent=f.n.split(' ').map(x=>x[0]).join('').slice(0,2);
   el('uname').textContent=f.n; el('urole').textContent=f.profile+' · '+PROFILES[f.profile].dept;
@@ -3384,8 +3382,11 @@ function globalSearchNow(q){
         <div style="flex:1"><b style="font-size:12px">${esc(x.name)}</b><div class="mini">${esc(x.developer)} · ${esc(x.sector)}</div></div></div>`).join('')}</div></div>`:'')
    , null, 'Close');
 }
-/* login role shortcuts */
-el('roleChips').innerHTML=USERS.map(u=>`<button onclick="el('lu').value='${esc(u.u)}';el('lp').value='${esc(u.p)}';doLogin()">${esc(u.n)} · ${esc(u.profile)}</button>`).join('');
+/* The login page used to list every account as a one-click chip that filled in
+   its password. Removed: the backend now verifies credentials, so those local
+   passwords no longer open anything — clicking one just produced a 401 and made
+   sign-in look broken — and publishing the whole staff list with passwords on a
+   public page was never something to keep once real auth existed. */
 /* ============================================================
    LEAD CHANNELS — getting leads in without third-party APIs
    ------------------------------------------------------------
@@ -4289,7 +4290,7 @@ window.doLogin = function(){
 
   let f = USERS.find(x=>x.u===u && x.p===p);
   if(!f && V6_loginType==='Secondary') f = USERS.find(x=>(x.baCode||'').toLowerCase()===u && x.p===p);
-  if(!f) return err('That ' + (V6_loginType==='Secondary' ? 'code and PIN don’t match.' : 'username and password don’t match. Try admin / 123.'));
+  if(!f) return err('That ' + (V6_loginType==='Secondary' ? 'code and PIN don’t match.' : 'username and password don’t match.'));
   if(f.active === false) return err('This login is deactivated. Ask an administrator.');
 
   if(V6_loginType==='Secondary'){
