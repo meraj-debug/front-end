@@ -314,7 +314,7 @@ table.v6-managed th{white-space:nowrap}
     <h2 style="font-size:19px;font-weight:800">Sign in to the CRM</h2>
     <p style="font-size:12px;color:var(--muted);margin:4px 0 16px">Pre-sales, sales, post-sales and approvals in one place.</p>
     <div id="loginErr" style="display:none;background:var(--bad-bg);color:var(--bad);padding:9px 11px;border-radius:8px;font-size:11.5px;font-weight:700;margin-bottom:10px"></div>
-    <div class="fg"><label class="f">Username</label><input id="lu" class="inp" placeholder="admin"></div>
+    <div class="fg"><label class="f">Username or e-mail</label><input id="lu" class="inp" placeholder="admin  ·  you@inframantra.com" onkeydown="if(event.key==='Enter')doLogin()"></div>
     <div class="fg"><label class="f">Password</label><input id="lp" type="password" class="inp" placeholder="123" onkeydown="if(event.key==='Enter')doLogin()"></div>
     <button class="btn btn-p" style="width:100%;justify-content:center;padding:11px" onclick="doLogin()">Sign in</button>
     <p style="font-size:10.5px;color:var(--muted-2);margin-top:14px">Tap a demo account below to sign in. Meraj Varid (System Admin): <b class="mono">meraj / Meraj@2026</b></p>
@@ -6122,19 +6122,98 @@ window.V6_mountLogin = function(){
   if(lu) lu.closest('.fg').style.display = '';
   if(lp) lp.closest('.fg').style.display = '';
 };
+/* ---- Sign-in ---------------------------------------------------------------
+   The backend is the authority: POST /api/auth/login verifies a bcrypt hash and
+   returns a JWT. The typed value may be either the CRM username or the user's
+   e-mail — the server matches both against one field.
+
+   The local USERS check survives only as an OFFLINE fallback. It is reached
+   when the API is unreachable (Render's free tier sleeps, see API_BOOT_TIMEOUT),
+   never when the API answered. A 401 is a real "no" and is shown as such —
+   falling back there would let a stale plaintext password in the snapshot beat
+   a rotated backend one, which is exactly what this change removes.          */
+const LOGIN_TIMEOUT = 20000;
+
+// Attach the JWT to the session token V6_signIn() just issued, so V7_headers()
+// starts sending `Authorization: Bearer …` on every state save. Must run AFTER
+// V6_signIn — V6_issueToken() rewrites the stored object.
+function V6_attachJwt(jwt){
+  try{
+    const tok = V6_readToken(); if(!tok) return;
+    tok.jwt = jwt;
+    localStorage.setItem(V6_TOKEN_KEY, JSON.stringify(tok));
+  }catch(e){}
+}
+
+/* Map the account the server authenticated onto a local USERS row, because all
+   the permission helpers (prof/can/act, city filters, ownership) read ME as a
+   local record. Matched on username, then e-mail; a user that exists only on
+   the server is added to the roster with no local password, so the offline
+   fallback can never sign them in on a stale credential. */
+function V6_localUserFor(su){
+  const uname = String(su.username || '').toLowerCase();
+  const mail  = String(su.email || '').toLowerCase();
+  let f = USERS.find(x => x.u === uname);
+  if(!f && mail) f = USERS.find(x => String(x.email || '').toLowerCase() === mail);
+  if(f) return f;
+
+  const profile = PROFILES[su.profile] ? su.profile : 'Pre-Sales Executive';
+  if(!PROFILES[su.profile])
+    console.warn('Unknown profile from server: ' + su.profile + ' — defaulting to ' + profile);
+  f = { u: uname, p: '', n: su.fullName || su.username || 'User', profile,
+        role: su.role || 'sales', fid: su.id || '', manager: '',
+        city: su.city || 'All', email: su.email || '' };
+  USERS.push(f);
+  return f;
+}
+
 window.doLogin = function(){
   const u = (el('lu').value || '').trim().toLowerCase();
   const p = (el('lp').value || '').trim();
   const err = t => { const e = el('loginErr'); e.textContent = t; e.style.display = 'block'; };
-  const f = USERS.find(x => x.u === u && x.p === p);
-  if(!f) return err('That username and password don’t match. Try admin / 123.');
+  const btn = document.querySelector('#login .btn-p');
+
+  if(!u || !p) return err('Enter your username or e-mail, and your password.');
+
+  el('loginErr').style.display = 'none';
+  if(btn){ btn.disabled = true; btn.innerHTML = '<i class="fa-solid fa-circle-notch fa-spin"></i> Signing in…'; }
+  const done = () => { if(btn){ btn.disabled = false; btn.innerHTML = 'Sign in'; } };
+
+  V7_api('/api/auth/login', {
+    method: 'POST',
+    body: JSON.stringify({ username: u, password: p })
+  }, LOGIN_TIMEOUT)
+    .then(res => {
+      done();
+      const f = V6_localUserFor(res.user || {});
+      if(f.active === false) return err('This login is deactivated. Ask an administrator.');
+      // No local expiry check here: the server verified the live password, and
+      // V6's lifecycle dates describe the snapshot's copy, not the server's.
+      V6_signIn(f);
+      V6_attachJwt(res.token);
+    })
+    .catch(e => {
+      done();
+      if(e.status === 401) return err('That username and password don’t match.');
+      if(e.status)         return err('Sign-in failed: ' + e.message);
+      // No status => the request never got an answer. Fall back to offline mode.
+      V6_offlineLogin(u, p, err);
+    });
+};
+
+/* Offline fallback: match the local snapshot on username OR e-mail. The V6
+   password lifecycle still applies here, since this path IS the local copy. */
+function V6_offlineLogin(u, p, err){
+  const f = USERS.find(x => (x.u === u || String(x.email || '').toLowerCase() === u) && x.p && x.p === p);
+  if(!f) return err('Can’t reach the server, and that username and password don’t match the offline copy.');
   if(f.active === false) return err('This login is deactivated. Ask an administrator.');
   const left = V6_pwdDaysLeft(f);
   if(f.mustChange || left <= 0){ V6_forceChange(f); return; }   // expiry policy stays
   V6_signIn(f);
+  setTimeout(()=>toast('Signed in offline — changes sync when the server is back','fa-cloud-arrow-up'), 900);
   if(left <= V6.sec.warnDays)
-    setTimeout(()=>toast('Your password expires in ' + left + ' day' + (left === 1 ? '' : 's') + ' — change it in Settings','fa-key'), 900);
-};
+    setTimeout(()=>toast('Your password expires in ' + left + ' day' + (left === 1 ? '' : 's') + ' — change it in Settings','fa-key'), 1800);
+}
 
 /* ============================================================================
    2 · THE LOGIN FORM INSIDE A DEAL — two types
@@ -6766,7 +6845,7 @@ function V7_api(path, opts, timeout){
       const body = await r.json().catch(()=>({}));
       if(!r.ok){
         const err = new Error(body.error || ('HTTP ' + r.status));
-        err.status = r.status; throw err;
+        err.status = r.status; err.body = body; throw err;
       }
       V7_online = true;
       return body;
@@ -6776,23 +6855,241 @@ function V7_api(path, opts, timeout){
 
 /* ---- Same contract the IndexedDB helpers had: put(key,val) / get(key). -----
    Only the transport changed, so every caller below is untouched.            */
+/* Optimistic-concurrency cursor: the `rev` this tab last read or wrote. Sent as
+   baseRev on every save, so the server can reject a write built on stale data
+   instead of letting one tab silently flatten another's work. */
+let V7_rev = null;
+
 function V7_idbPut(key, val, opts){
+  const force = !!(opts && opts.force);
+  const body = { data: val, by: (ME && ME.n) || '' };
+  // Omit baseRev on a forced save — that is the deliberate "mine wins" path.
+  if(!force && V7_rev !== null) body.baseRev = V7_rev;
+
   return V7_api('/api/state/' + encodeURIComponent(key), {
     method: 'PUT',
-    body: JSON.stringify({ data: val, by: (ME && ME.n) || '' }),
+    body: JSON.stringify(body),
     keepalive: !!(opts && opts.keepalive)
-  }).then(res=>{ V7_outboxClear(); return res; })
-    .catch(e=>{ V7_outboxSet(key, val); throw e; });
+  }).then(res=>{
+      if(typeof res.rev === 'number') V7_rev = res.rev;
+      V7_outboxClear();
+      return res;
+    })
+    .catch(e=>{
+      // Always park the payload: a conflict must not throw the edit away either.
+      V7_outboxSet(key, val);
+      if(e.status === 409) V7_onConflict(key, val, e.body || {});
+      throw e;
+    });
 }
 
 function V7_idbGet(key){
   return V7_api('/api/state/' + encodeURIComponent(key), { method: 'GET' }, API_BOOT_TIMEOUT)
-    .then(res=>res.data);
+    .then(res=>{ V7_rev = typeof res.rev === 'number' ? res.rev : null; return res.data; });
 }
+
+/* ---- Save conflict ---------------------------------------------------------
+   Someone else saved while this tab was editing. Because the whole CRM travels
+   as ONE snapshot there is no field-level merge to do — the two versions are
+   whole-database alternatives, so the choice has to go to the person. Silently
+   picking either side is what caused the overwrites in the first place.      */
+let V7_conflictOpen = false;
+
+function V7_onConflict(key, mine, info){
+  if(V7_conflictOpen) return;              // one prompt, not one per retry
+  V7_conflictOpen = true;
+  clearTimeout(_saveT);                     // stop the debounce re-firing behind the modal
+
+  const who  = info.updatedByName ? esc(info.updatedByName) : 'Someone else';
+  const when = info.updatedAt ? new Date(info.updatedAt).toLocaleString() : 'just now';
+
+  modal('Someone else saved first', `
+    <p class="hint" style="margin:0 0 10px"><i class="fa-solid fa-triangle-exclamation"></i>
+      <b>${who}</b> saved changes at ${esc(when)}, after this tab loaded its copy.</p>
+    <p style="margin:0 0 12px;font-size:12.5px">The CRM saves as one document, so these
+      can't be merged automatically. Your unsaved changes are kept locally either way.</p>
+    <div class="grid" style="gap:8px">
+      <button class="btn btn-o" style="justify-content:flex-start" onclick="V7_conflictTakeTheirs()">
+        <i class="fa-solid fa-cloud-arrow-down"></i>
+        <span><b>Load their version</b><br><span class="mini">Discards what you changed in this tab.</span></span>
+      </button>
+      <button class="btn btn-o" style="justify-content:flex-start" onclick="V7_conflictKeepMine()">
+        <i class="fa-solid fa-cloud-arrow-up"></i>
+        <span><b>Keep mine</b><br><span class="mini">Overwrites ${who}'s changes.</span></span>
+      </button>
+    </div>`, null, 'Decide later');
+}
+
+window.V7_conflictTakeTheirs = function(){
+  closeModal(); V7_conflictOpen = false;
+  V7_idbGet('db')
+    .then(s=>{
+      if(V7_restore(s)){
+        V7_outboxClear();
+        V7_lastHash = null;                 // force the next real edit to save
+        buildNav(); render();
+        toast('Loaded the newer version from the server','fa-cloud-arrow-down');
+      } else {
+        toast('The server copy could not be read — your changes are still queued','fa-triangle-exclamation');
+      }
+    })
+    .catch(()=>toast('Could not reach the server — your changes are still queued','fa-plug-circle-xmark'));
+};
+
+/* Dismissing the prompt ("Decide later", Esc, the ✕) must re-arm it, or the
+   conflict would never be raised again and the edit would sit queued in silence. */
+const V7_closeModalBase = closeModal;
+window.closeModal = function(){ V7_conflictOpen = false; V7_closeModalBase(); };
+
+window.V7_conflictKeepMine = function(){
+  closeModal(); V7_conflictOpen = false;
+  const pending = V7_outboxRead();
+  const payload = pending ? pending.val : JSON.parse(JSON.stringify(V7_snapshot()));
+  V7_idbPut('db', payload, { force: true })
+    .then(()=>toast('Saved — your version is now the current one','fa-cloud-arrow-up'))
+    .catch(e=>toast('Save failed: ' + e.message,'fa-triangle-exclamation'));
+};
 
 function V7_idbDelete(key){
   return V7_api('/api/state/' + encodeURIComponent(key), { method: 'DELETE' });
 }
+
+/* ============================================================================
+   4b · CUSTOMERS — DUAL-WRITE (migration stage 1 of 2)
+   ----------------------------------------------------------------------------
+   Customers now also live in a real Mongo collection behind /api/customers.
+   During this stage the SNAPSHOT REMAINS AUTHORITATIVE: every read still comes
+   from DB.customers, and nothing below can change what the user sees. We only
+   mirror writes outward, so the collection can be compared against the blob
+   before reads are flipped over (stage 2).
+
+   Why diff at save time instead of calling the API from newCustomer(),
+   setField(), editField(), commitCustStage(), markLeadComplete(), abortModal(),
+   addNote() and the rest: there are dozens of mutation sites, and any one
+   missed would silently drift. The save path is the single choke point every
+   mutation already funnels through, so diffing here cannot miss an edit.
+
+   Failures are deliberately non-fatal — a mirror that breaks the CRM would be
+   worse than no mirror. Anything that fails is simply retried on the next save,
+   because the baseline is only advanced for records that actually synced.   */
+
+const CUST_TRAILS = ['notes', 'activities', 'comms', 'chatter'];
+// Never PATCH these: `id` is immutable, the trails have their own endpoint, and
+// audit is written server-side from the diff.
+const CUST_SKIP = new Set(['id', 'audit', ...CUST_TRAILS]);
+// Cap per cycle so a bulk import can't blow the API's 240/min budget. The
+// remainder goes out on the next save rather than being dropped.
+const CUST_SYNC_MAX = 25;
+
+let V7_custBase = new Map();      // id -> { fields:{...}, lens:{notes:n,...} }
+let V7_custDrift = 0;             // records that failed to mirror, for the UI
+
+const V7_custFields = (c) => {
+  const out = {};
+  for(const k of Object.keys(c)) if(!CUST_SKIP.has(k) && typeof c[k] !== 'function') out[k] = c[k];
+  return out;
+};
+const V7_custLens = (c) => {
+  const l = {};
+  for(const t of CUST_TRAILS) l[t] = (c[t] || []).length;
+  return l;
+};
+function V7_custSnapshotOne(c){ return { fields: V7_custFields(c), lens: V7_custLens(c) }; }
+
+/* Seed the baseline from whatever we just loaded, so a page load does not
+   re-POST every existing customer. Initial population is the backfill script's
+   job (npm run backfill:customers:write) — this only carries changes made from
+   here on. */
+function V7_custBaseline(){
+  V7_custBase = new Map();
+  (DB.customers || []).forEach(c => V7_custBase.set(c.id, V7_custSnapshotOne(c)));
+}
+
+function V7_custHasJwt(){
+  try{ const t = JSON.parse(localStorage.getItem(V6_TOKEN_KEY) || 'null'); return !!(t && t.jwt); }
+  catch(e){ return false; }
+}
+
+/* Mirror everything that changed since the last successful sync. */
+function V7_custSync(){
+  // The customer routes are JWT-only. An offline sign-in has no JWT, so there
+  // is nothing to mirror with — the snapshot still holds the edit either way.
+  if(!V7_custHasJwt() || !V7_online) return Promise.resolve();
+
+  const jobs = [];
+  for(const c of DB.customers || []){
+    if(jobs.length >= CUST_SYNC_MAX) break;
+    const prev = V7_custBase.get(c.id);
+
+    if(!prev){ jobs.push(V7_custCreate(c)); continue; }
+
+    const fields = V7_custFields(c), patch = {};
+    for(const k of Object.keys(fields))
+      if(JSON.stringify(fields[k]) !== JSON.stringify(prev.fields[k])) patch[k] = fields[k];
+
+    const lens = V7_custLens(c);
+    const grew = CUST_TRAILS.filter(t => lens[t] > (prev.lens[t] || 0));
+
+    if(Object.keys(patch).length || grew.length) jobs.push(V7_custUpdate(c, patch, grew, prev));
+  }
+
+  if(!jobs.length) return Promise.resolve();
+  return Promise.all(jobs).then(rs=>{
+    const failed = rs.filter(r => r === false).length;
+    V7_custDrift = failed;
+    if(failed) console.warn(`Customer mirror: ${failed} record(s) did not sync; retrying on next save.`);
+  });
+}
+
+function V7_custCreate(c){
+  return V7_api('/api/customers', { method: 'POST', body: JSON.stringify(c) })
+    .then(()=>{ V7_custBase.set(c.id, V7_custSnapshotOne(c)); return true; })
+    .catch(e=>{
+      // 400 means this record can never be accepted as-is (no name, say).
+      // Baseline it anyway or every future save retries it forever.
+      if(e.status === 400){ V7_custBase.set(c.id, V7_custSnapshotOne(c)); console.warn('Customer ' + c.id + ' rejected by the API: ' + e.message); return true; }
+      return false;
+    });
+}
+
+function V7_custUpdate(c, patch, grew, prev){
+  const calls = [];
+  if(Object.keys(patch).length)
+    calls.push(V7_api('/api/customers/' + encodeURIComponent(c.id), { method: 'PATCH', body: JSON.stringify(patch) }));
+
+  // Trails are unshifted at the front locally, so the new entries are the head
+  // of the array. Send them oldest-first: the server also inserts at position 0,
+  // so reversing here preserves the original order on the other side.
+  for(const t of grew){
+    const added = (c[t] || []).slice(0, (c[t] || []).length - (prev.lens[t] || 0)).reverse();
+    for(const entry of added)
+      calls.push(V7_api('/api/customers/' + encodeURIComponent(c.id) + '/' + t, { method: 'POST', body: JSON.stringify(entry) }));
+  }
+
+  return Promise.all(calls)
+    .then(()=>{ V7_custBase.set(c.id, V7_custSnapshotOne(c)); return true; })
+    .catch(e=>{
+      // A 404 here means the row was never created (backfill not run yet, or the
+      // caller can't see it). Try creating it, so a fresh deploy self-heals.
+      if(e.status === 404) return V7_custCreate(c);
+      return false;
+    });
+}
+
+/* Manual full push, for the first cutover if you would rather not run the
+   backfill script — resets the baseline so every customer is re-sent. Creates
+   are idempotent server-side, so this is safe to run more than once.
+   Call from the console: V7_custSyncAll()                                    */
+window.V7_custSyncAll = function(){
+  V7_custBase = new Map();
+  const step = () => V7_custSync().then(()=>{
+    const done = V7_custBase.size, total = (DB.customers || []).length;
+    console.info(`Customer mirror: ${done}/${total}`);
+    if(done < total) return step();
+    toast('All customers mirrored to the database','fa-database');
+  });
+  return step();
+};
 
 /* ---- Offline outbox --------------------------------------------------------
    A failed save is parked in localStorage so a dropped connection or a sleeping
@@ -6843,6 +7140,10 @@ function V7_save(){
     V7_idbPut('db', payload)
       .then(()=>{ V7_lastSave = new Date(); V7_lastHash = body; })
       .catch(e=>console.warn('Backend save failed (queued for retry):', e.message))
+      // Mirror customer changes into their own collection. Runs whether or not
+      // the snapshot write succeeded, and can never reject — the snapshot is
+      // still the system of record during this migration stage.
+      .then(()=>V7_custSync().catch(e=>console.warn('Customer mirror failed:', e.message)))
       .finally(()=>{ V7_saving = false; });
   }, 1200);
 }
@@ -6866,6 +7167,10 @@ function V7_restore(s){
     V7.payouts = s.v7.payouts || {};
   }
   reindex();
+  // Everything just loaded is assumed to be already in the customers collection
+  // (put there by npm run backfill:customers:write), so only edits made from
+  // here on are mirrored. V7_custSyncAll() forces a full push if it isn't.
+  V7_custBaseline();
   return true;
 }
 /* boot: load from the backend BEFORE anything seeds, then restore the session */
@@ -6959,6 +7264,7 @@ function vStorage(){
         <div class="kpi"><div class="l">Connection</div><div class="n" style="font-size:15px">${V7_online ? 'Online' : 'Offline'}</div><div class="s">${esc(API_BASE.replace(/^https?:\/\//,''))}</div></div>
         <div class="kpi"><div class="l">Queued changes</div><div class="n">${V7_outboxRead() ? 1 : 0}</div><div class="s">${V7_outboxRead() ? 'waiting to sync' : 'all synced'}</div></div>
         <div class="kpi"><div class="l">Last saved</div><div class="n" style="font-size:15px">${V7_lastSave ? ftime(V7_lastSave) : '—'}</div><div class="s">auto-saves after every change</div></div>
+        <div class="kpi"><div class="l">Customer mirror</div><div class="n" style="font-size:15px">${V7_custDrift ? V7_custDrift + ' pending' : 'In sync'}</div><div class="s">${V7_custBase.size} of ${DB.customers.length} in the database</div></div>
       </div>
       <p class="hint" style="margin-top:10px"><i class="fa-solid fa-circle-info"></i>
         Everything — customers, deals, bookings, activity photos, GPS pins, list views, assignment rules, incentives — is stored permanently on the
