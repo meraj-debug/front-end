@@ -4331,11 +4331,17 @@ function V6_forceChange(user){
     <div class="fg"><label class="f">Confirm new password <span>*</span></label><input id="pw2" type="password" class="inp"></div>`,
    ()=>{
      const a = el('pw1').value.trim(), b = el('pw2').value.trim();
-     if(a.length < 3) return toast('Use at least 3 characters (demo rule)','fa-triangle-exclamation');
+     if(a.length < 8) return toast('Use at least 8 characters','fa-triangle-exclamation');
      if(a !== b)      return toast('The two passwords do not match','fa-triangle-exclamation');
-     if(a === user.p) return toast('Choose a password you have not used before','fa-triangle-exclamation');
-     user.p = a; user.pwdChangedAt = V6_now(); user.mustChange = false;
-     closeModal(); toast('Password updated'); V6_signIn(user);
+     // This runs straight after a successful sign-in, so the password just
+     // typed on the login screen is the current one the server expects.
+     const cur = (el('lp') && el('lp').value.trim()) || '';
+     V7_api('/api/users/me/change-password', { method:'POST', body: JSON.stringify({ currentPassword: cur, newPassword: a }) })
+       .then(()=>{
+         user.p = ''; user.pwdChangedAt = V6_now(); user.mustChange = false;
+         closeModal(); toast('Password updated'); V6_signIn(user);
+       })
+       .catch(e=>toast(e.message,'fa-triangle-exclamation'));
    }, 'Set new password');
 }
 function V6_changeMyPassword(){
@@ -4345,26 +4351,54 @@ function V6_changeMyPassword(){
     <div class="fg"><label class="f">Confirm</label><input id="pc2" type="password" class="inp"></div>
     <p class="hint">Expires every ${V6.sec.pwdDays} days · you get a warning ${V6.sec.warnDays} days before.</p>`,
    ()=>{
-     if(el('pc0').value.trim() !== ME.p) return toast('Current password is wrong','fa-triangle-exclamation');
-     const a = el('pc1').value.trim();
-     if(a.length < 3) return toast('Too short','fa-triangle-exclamation');
+     const cur = el('pc0').value.trim(), a = el('pc1').value.trim();
+     if(a.length < 8) return toast('Use at least 8 characters','fa-triangle-exclamation');
      if(a !== el('pc2').value.trim()) return toast('Passwords do not match','fa-triangle-exclamation');
-     ME.p = a; ME.pwdChangedAt = V6_now(); ME.mustChange = false;
-     closeModal(); toast('Password changed');
+     // The server verifies the current password against the stored hash — this
+     // browser has no copy of it to check against any more.
+     V7_api('/api/users/me/change-password', { method:'POST', body: JSON.stringify({ currentPassword: cur, newPassword: a }) })
+       .then(()=>{
+         ME.p = ''; ME.pwdChangedAt = V6_now(); ME.mustChange = false;
+         closeModal(); toast('Password changed — use it next time you sign in','fa-key');
+       })
+       .catch(e=>toast(e.message,'fa-triangle-exclamation'));
    }, 'Change password');
 }
+/* Admin: reset another user's password.
+   The SERVER owns this now. It generates the temporary password, stores its
+   hash, flags the account, and e-mails the user directly — so the password that
+   arrives is the one that actually signs them in. The old version only rewrote
+   `usr.p` in this browser's snapshot, which since the move to real auth changed
+   nothing at all: the temp password was e-mailed and then rejected at login.
+
+   The temporary password is deliberately never returned to this screen. It
+   exists only in the recipient's inbox, so an admin cannot read it. */
 function V6_resetUserPwd(u){
   const usr = USERS.find(x=>x.u===u); if(!usr) return;
-  const pwd = V6_genPassword();
-  usr.p = pwd; usr.mustChange = true; usr.pwdChangedAt = V6_now();
-  V6_sendMail({
-    to: usr.email, name: usr.n,
-    subject: 'Your InfraMantra CRM password has been reset',
-    body: `Hi ${usr.n},\n\nYour password has been reset by an administrator.\n\n`+
-          `Login URL : ${location.href.split('#')[0]}\nUsername  : ${usr.u}\nTemporary password : ${pwd}\n\n`+
-          `You'll be asked to set a new password the first time you sign in.\n\n— InfraMantra CRM`
-  });
-  toast('New password emailed to ' + usr.email,'fa-envelope-circle-check'); render();
+
+  if(!confirm('Reset the password for ' + usr.n + '?\n\nA new temporary password will be e-mailed to them and their current one will stop working.')) return;
+
+  toast('Resetting…','fa-circle-notch fa-spin');
+  V7_api('/api/users/' + encodeURIComponent(usr.u) + '/reset-password', { method: 'POST' })
+    .then(res=>{
+      usr.mustChange = true; usr.pwdChangedAt = V6_now();
+      usr.p = '';                       // the local copy is no longer meaningful
+      // Record it in the outbox so there is still an on-screen audit trail.
+      V6_logMail({ to: res.emailedTo, name: usr.n,
+        subject: 'Your Inframantra CRM password has been reset',
+        body: 'Sent by the server to ' + res.emailedTo + '. The temporary password is not shown here — it is only in their inbox.',
+        status: 'sent' });
+      toast('New password e-mailed to ' + res.emailedTo,'fa-envelope-circle-check');
+      render();
+    })
+    .catch(e=>{
+      // 422 no e-mail on record · 503 SMTP unconfigured · 502 send failed.
+      // In every one of those the server left the password untouched.
+      modal('Password not reset', `
+        <p class="hint" style="margin:0 0 10px"><i class="fa-solid fa-triangle-exclamation"></i>${esc(e.message)}</p>
+        <p style="font-size:12.5px;margin:0">${esc(usr.n)}'s current password still works — nothing was changed.</p>`,
+        null, 'Close');
+    });
 }
 
 /* ============================================================================
@@ -4379,6 +4413,15 @@ function V6_genPassword(){
   let base=[pick(A),pick(A),pick(a),pick(a),pick(a),pick(d),pick(d),pick(d),pick(s)];
   for(let i=base.length-1;i>0;i--){const j=Math.floor(Math.random()*(i+1));[base[i],base[j]]=[base[j],base[i]];}
   return base.join('');
+}
+/* Record a mail the SERVER sent, so the Email outbox screen still shows a
+   trail. No delivery attempt happens here — the backend already did it. */
+function V6_logMail(rec){
+  const m = { id:V6_uid('MAIL'), to:rec.to, name:rec.name||'', subject:rec.subject,
+              body:rec.body, at:V6_now(), status:rec.status||'sent' };
+  if(!V6.outbox) V6.outbox=[];
+  V6.outbox.unshift(m);
+  return m;
 }
 function V6_deliverMail(mail){
   /* ▼▼▼ WIRE A REAL EMAIL SERVICE HERE ▼▼▼
